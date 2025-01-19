@@ -1,19 +1,18 @@
-use super::{align_view, Align, Context, Editor};
+use super::{Context, Editor};
 use crate::{
     compositor::{self, Compositor},
     job::{Callback, Jobs},
-    ui::{self, overlay::overlayed, FilePicker, Picker, Popup, Prompt, PromptEvent, Text},
+    ui::{self, overlay::overlaid, Picker, Popup, Prompt, PromptEvent, Text},
 };
-use helix_core::{
-    syntax::{DebugArgumentValue, DebugConfigCompletion},
-    Selection,
-};
-use helix_dap::{self as dap, Client, ThreadId};
+use dap::{StackFrame, Thread, ThreadStates};
+use helix_core::syntax::{DebugArgumentValue, DebugConfigCompletion, DebugTemplate};
+use helix_dap::{self as dap, Client};
 use helix_lsp::block_on;
 use helix_view::editor::Breakpoint;
 
 use serde_json::{to_value, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tui::text::Spans;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -21,79 +20,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, bail};
 
-#[macro_export]
-macro_rules! debugger {
-    ($editor:expr) => {{
-        match &mut $editor.debugger {
-            Some(debugger) => debugger,
-            None => return,
-        }
-    }};
-}
-
-// general utils:
-pub fn dap_pos_to_pos(doc: &helix_core::Rope, line: usize, column: usize) -> Option<usize> {
-    // 1-indexing to 0 indexing
-    let line = doc.try_line_to_char(line - 1).ok()?;
-    let pos = line + column.saturating_sub(1);
-    // TODO: this is probably utf-16 offsets
-    Some(pos)
-}
-
-pub async fn select_thread_id(editor: &mut Editor, thread_id: ThreadId, force: bool) {
-    let debugger = debugger!(editor);
-
-    if !force && debugger.thread_id.is_some() {
-        return;
-    }
-
-    debugger.thread_id = Some(thread_id);
-    fetch_stack_trace(debugger, thread_id).await;
-
-    let frame = debugger.stack_frames[&thread_id].get(0).cloned();
-    if let Some(frame) = &frame {
-        jump_to_stack_frame(editor, frame);
-    }
-}
-
-pub async fn fetch_stack_trace(debugger: &mut Client, thread_id: ThreadId) {
-    let (frames, _) = match debugger.stack_trace(thread_id).await {
-        Ok(frames) => frames,
-        Err(_) => return,
-    };
-    debugger.stack_frames.insert(thread_id, frames);
-    debugger.active_frame = Some(0);
-}
-
-pub fn jump_to_stack_frame(editor: &mut Editor, frame: &helix_dap::StackFrame) {
-    let path = if let Some(helix_dap::Source {
-        path: Some(ref path),
-        ..
-    }) = frame.source
-    {
-        path.clone()
-    } else {
-        return;
-    };
-
-    if let Err(e) = editor.open(path, helix_view::editor::Action::Replace) {
-        editor.set_error(format!("Unable to jump to stack frame: {}", e));
-        return;
-    }
-
-    let (view, doc) = current!(editor);
-
-    let text_end = doc.text().len_chars().saturating_sub(1);
-    let start = dap_pos_to_pos(doc.text(), frame.line, frame.column).unwrap_or(0);
-    let end = frame
-        .end_line
-        .and_then(|end_line| dap_pos_to_pos(doc.text(), end_line, frame.end_column.unwrap_or(0)))
-        .unwrap_or(start);
-
-    let selection = Selection::single(start.min(text_end), end.min(text_end));
-    doc.set_selection(view.id, selection);
-    align_view(doc, view, Align::Center);
-}
+use helix_view::handlers::dap::{breakpoints_changed, jump_to_stack_frame, select_thread_id};
 
 fn thread_picker(
     cx: &mut Context,
@@ -105,9 +32,7 @@ fn thread_picker(
     dap_callback(
         cx.jobs,
         future,
-        move |editor: &mut Editor,
-              compositor: &mut Compositor,
-              response: dap::requests::ThreadsResponse| {
+        move |editor, compositor, response: dap::requests::ThreadsResponse| {
             let threads = response.threads;
             if threads.len() == 1 {
                 callback_fn(editor, &threads[0]);
@@ -116,31 +41,33 @@ fn thread_picker(
             let debugger = debugger!(editor);
 
             let thread_states = debugger.thread_states.clone();
-            let picker = FilePicker::new(
+            let columns = [
+                ui::PickerColumn::new("name", |item: &Thread, _| item.name.as_str().into()),
+                ui::PickerColumn::new("state", |item: &Thread, thread_states: &ThreadStates| {
+                    thread_states
+                        .get(&item.id)
+                        .map(|state| state.as_str())
+                        .unwrap_or("unknown")
+                        .into()
+                }),
+            ];
+            let picker = Picker::new(
+                columns,
+                0,
                 threads,
-                move |thread| {
-                    format!(
-                        "{} ({})",
-                        thread.name,
-                        thread_states
-                            .get(&thread.id)
-                            .map(|state| state.as_str())
-                            .unwrap_or("unknown")
-                    )
-                    .into()
-                },
+                thread_states,
                 move |cx, thread, _action| callback_fn(cx.editor, thread),
-                move |editor, thread| {
-                    let frames = editor.debugger.as_ref()?.stack_frames.get(&thread.id)?;
-                    let frame = frames.get(0)?;
-                    let path = frame.source.as_ref()?.path.clone()?;
-                    let pos = Some((
-                        frame.line.saturating_sub(1),
-                        frame.end_line.unwrap_or(frame.line).saturating_sub(1),
-                    ));
-                    Some((path, pos))
-                },
-            );
+            )
+            .with_preview(move |editor, thread| {
+                let frames = editor.debugger.as_ref()?.stack_frames.get(&thread.id)?;
+                let frame = frames.first()?;
+                let path = frame.source.as_ref()?.path.as_ref()?.as_path();
+                let pos = Some((
+                    frame.line.saturating_sub(1),
+                    frame.end_line.unwrap_or(frame.line).saturating_sub(1),
+                ));
+                Some((path.into(), pos))
+            });
             compositor.push(Box::new(picker));
         },
     );
@@ -171,11 +98,14 @@ fn dap_callback<T, F>(
     let callback = Box::pin(async move {
         let json = call.await?;
         let response = serde_json::from_value(json)?;
-        let call: Callback = Box::new(move |editor: &mut Editor, compositor: &mut Compositor| {
-            callback(editor, compositor, response)
-        });
+        let call: Callback = Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
+                callback(editor, compositor, response)
+            },
+        ));
         Ok(call)
     });
+
     jobs.callback(callback);
 }
 
@@ -190,7 +120,7 @@ pub fn dap_start_impl(
     let config = doc
         .language_config()
         .and_then(|config| config.debugger.as_ref())
-        .ok_or(anyhow!("No debug adapter available for language"))?;
+        .ok_or_else(|| anyhow!("No debug adapter available for language"))?;
 
     let result = match socket {
         Some(socket) => block_on(Client::tcp(socket, 0)),
@@ -218,15 +148,15 @@ pub fn dap_start_impl(
     // TODO: avoid refetching all of this... pass a config in
     let template = match name {
         Some(name) => config.templates.iter().find(|t| t.name == name),
-        None => config.templates.get(0),
+        None => config.templates.first(),
     }
-    .ok_or(anyhow!("No debug config with given name"))?;
+    .ok_or_else(|| anyhow!("No debug config with given name"))?;
 
     let mut args: HashMap<&str, Value> = HashMap::new();
 
-    if let Some(params) = params {
-        for (k, t) in &template.args {
-            let mut value = t.clone();
+    for (k, t) in &template.args {
+        let mut value = t.clone();
+        if let Some(ref params) = params {
             for (i, x) in params.iter().enumerate() {
                 let mut param = x.to_string();
                 if let Some(DebugConfigCompletion::Advanced(cfg)) = template.completion.get(i) {
@@ -250,24 +180,26 @@ pub fn dap_start_impl(
                     DebugArgumentValue::Boolean(_) => value,
                 };
             }
+        }
 
-            match value {
-                DebugArgumentValue::String(string) => {
-                    if let Ok(integer) = string.parse::<usize>() {
-                        args.insert(k, to_value(integer).unwrap());
-                    } else {
-                        args.insert(k, to_value(string).unwrap());
-                    }
+        match value {
+            DebugArgumentValue::String(string) => {
+                if let Ok(integer) = string.parse::<usize>() {
+                    args.insert(k, to_value(integer).unwrap());
+                } else {
+                    args.insert(k, to_value(string).unwrap());
                 }
-                DebugArgumentValue::Array(arr) => {
-                    args.insert(k, to_value(arr).unwrap());
-                }
-                DebugArgumentValue::Boolean(bool) => {
-                    args.insert(k, to_value(bool).unwrap());
-                }
+            }
+            DebugArgumentValue::Array(arr) => {
+                args.insert(k, to_value(arr).unwrap());
+            }
+            DebugArgumentValue::Boolean(bool) => {
+                args.insert(k, to_value(bool).unwrap());
             }
         }
     }
+
+    args.insert("cwd", to_value(helix_stdx::env::current_working_dir())?);
 
     let args = to_value(args).unwrap();
 
@@ -318,23 +250,66 @@ pub fn dap_launch(cx: &mut Context) {
 
     let templates = config.templates.clone();
 
-    cx.push_layer(Box::new(overlayed(Picker::new(
+    let columns = [ui::PickerColumn::new(
+        "template",
+        |item: &DebugTemplate, _| item.name.as_str().into(),
+    )];
+
+    cx.push_layer(Box::new(overlaid(Picker::new(
+        columns,
+        0,
         templates,
-        |template| template.name.as_str().into(),
+        (),
         |cx, template, _action| {
-            let completions = template.completion.clone();
-            let name = template.name.clone();
-            let callback = Box::pin(async move {
-                let call: Callback =
-                    Box::new(move |_editor: &mut Editor, compositor: &mut Compositor| {
-                        let prompt = debug_parameter_prompt(completions, name, Vec::new());
-                        compositor.push(Box::new(prompt));
-                    });
-                Ok(call)
-            });
-            cx.jobs.callback(callback);
+            if template.completion.is_empty() {
+                if let Err(err) = dap_start_impl(cx, Some(&template.name), None, None) {
+                    cx.editor.set_error(err.to_string());
+                }
+            } else {
+                let completions = template.completion.clone();
+                let name = template.name.clone();
+                let callback = Box::pin(async move {
+                    let call: Callback =
+                        Callback::EditorCompositor(Box::new(move |_editor, compositor| {
+                            let prompt = debug_parameter_prompt(completions, name, Vec::new());
+                            compositor.push(Box::new(prompt));
+                        }));
+                    Ok(call)
+                });
+                cx.jobs.callback(callback);
+            }
         },
     ))));
+}
+
+pub fn dap_restart(cx: &mut Context) {
+    let debugger = match &cx.editor.debugger {
+        Some(debugger) => debugger,
+        None => {
+            cx.editor.set_error("Debugger is not running");
+            return;
+        }
+    };
+    if !debugger
+        .capabilities()
+        .supports_restart_request
+        .unwrap_or(false)
+    {
+        cx.editor
+            .set_error("Debugger does not support session restarts");
+        return;
+    }
+    if debugger.starting_request_args().is_none() {
+        cx.editor
+            .set_error("No arguments found with which to restart the sessions");
+        return;
+    }
+
+    dap_callback(
+        cx.jobs,
+        debugger.restart(),
+        |editor, _compositor, _resp: ()| editor.set_status("Debugging session restarted"),
+    );
 }
 
 fn debug_parameter_prompt(
@@ -359,8 +334,12 @@ fn debug_parameter_prompt(
     .to_owned();
 
     let completer = match field_type {
-        "filename" => ui::completers::filename,
-        "directory" => ui::completers::directory,
+        "filename" => |editor: &Editor, input: &str| {
+            ui::completers::filename_with_git_ignore(editor, input, false)
+        },
+        "directory" => |editor: &Editor, input: &str| {
+            ui::completers::directory_with_git_ignore(editor, input, false)
+        },
         _ => ui::completers::none,
     };
 
@@ -385,10 +364,10 @@ fn debug_parameter_prompt(
                 let params = params.clone();
                 let callback = Box::pin(async move {
                     let call: Callback =
-                        Box::new(move |_editor: &mut Editor, compositor: &mut Compositor| {
+                        Callback::EditorCompositor(Box::new(move |_editor, compositor| {
                             let prompt = debug_parameter_prompt(completions, config_name, params);
                             compositor.push(Box::new(prompt));
-                        });
+                        }));
                     Ok(call)
                 });
                 cx.jobs.callback(callback);
@@ -417,63 +396,6 @@ pub fn dap_toggle_breakpoint(cx: &mut Context) {
     let text = doc.text().slice(..);
     let line = doc.selection(view.id).primary().cursor_line(text);
     dap_toggle_breakpoint_impl(cx, path, line);
-}
-
-pub fn breakpoints_changed(
-    debugger: &mut dap::Client,
-    path: PathBuf,
-    breakpoints: &mut [Breakpoint],
-) -> Result<(), anyhow::Error> {
-    // TODO: handle capabilities correctly again, by filterin breakpoints when emitting
-    // if breakpoint.condition.is_some()
-    //     && !debugger
-    //         .caps
-    //         .as_ref()
-    //         .unwrap()
-    //         .supports_conditional_breakpoints
-    //         .unwrap_or_default()
-    // {
-    //     bail!(
-    //         "Can't edit breakpoint: debugger does not support conditional breakpoints"
-    //     )
-    // }
-    // if breakpoint.log_message.is_some()
-    //     && !debugger
-    //         .caps
-    //         .as_ref()
-    //         .unwrap()
-    //         .supports_log_points
-    //         .unwrap_or_default()
-    // {
-    //     bail!("Can't edit breakpoint: debugger does not support logpoints")
-    // }
-    let source_breakpoints = breakpoints
-        .iter()
-        .map(|breakpoint| helix_dap::SourceBreakpoint {
-            line: breakpoint.line + 1, // convert from 0-indexing to 1-indexing (TODO: could set debugger to 0-indexing on init)
-            ..Default::default()
-        })
-        .collect::<Vec<_>>();
-
-    let request = debugger.set_breakpoints(path, source_breakpoints);
-    match block_on(request) {
-        Ok(Some(dap_breakpoints)) => {
-            for (breakpoint, dap_breakpoint) in breakpoints.iter_mut().zip(dap_breakpoints) {
-                breakpoint.id = dap_breakpoint.id;
-                breakpoint.verified = dap_breakpoint.verified;
-                breakpoint.message = dap_breakpoint.message;
-                // TODO: handle breakpoint.message
-                // TODO: verify source matches
-                breakpoint.line = dap_breakpoint.line.unwrap_or(0).saturating_sub(1); // convert to 0-indexing
-                                                                                      // TODO: no unwrap
-                breakpoint.column = dap_breakpoint.column;
-                // TODO: verify end_linef/col instruction reference, offset
-            }
-        }
-        Err(e) => anyhow::bail!("Failed to set breakpoints: {}", e),
-        _ => {}
-    };
-    Ok(())
 }
 
 pub fn dap_toggle_breakpoint_impl(cx: &mut Context, path: PathBuf, line: usize) {
@@ -580,19 +502,37 @@ pub fn dap_variables(cx: &mut Context) {
 
     if debugger.thread_id.is_none() {
         cx.editor
-            .set_status("Cannot access variables while target is running");
+            .set_status("Cannot access variables while target is running.");
         return;
     }
     let (frame, thread_id) = match (debugger.active_frame, debugger.thread_id) {
         (Some(frame), Some(thread_id)) => (frame, thread_id),
         _ => {
             cx.editor
-                .set_status("Cannot find current stack frame to access variables");
+                .set_status("Cannot find current stack frame to access variables.");
             return;
         }
     };
 
-    let frame_id = debugger.stack_frames[&thread_id][frame].id;
+    let thread_frame = match debugger.stack_frames.get(&thread_id) {
+        Some(thread_frame) => thread_frame,
+        None => {
+            cx.editor
+                .set_error(format!("Failed to get stack frame for thread: {thread_id}"));
+            return;
+        }
+    };
+    let stack_frame = match thread_frame.get(frame) {
+        Some(stack_frame) => stack_frame,
+        None => {
+            cx.editor.set_error(format!(
+                "Failed to get stack frame for thread {thread_id} and frame {frame}."
+            ));
+            return;
+        }
+    };
+
+    let frame_id = stack_frame.id;
     let scopes = match block_on(debugger.scopes(frame_id)) {
         Ok(s) => s,
         Err(e) => {
@@ -611,7 +551,7 @@ pub fn dap_variables(cx: &mut Context) {
 
     for scope in scopes.iter() {
         // use helix_view::graphics::Style;
-        use tui::text::{Span, Spans};
+        use tui::text::Span;
         let response = block_on(debugger.variables(scope.variables_reference));
 
         variables.push(Spans::from(Span::styled(
@@ -638,13 +578,13 @@ pub fn dap_variables(cx: &mut Context) {
 
     let contents = Text::from(tui::text::Text::from(variables));
     let popup = Popup::new("dap-variables", contents);
-    cx.push_layer(Box::new(popup));
+    cx.replace_or_push_layer("dap-variables", popup);
 }
 
 pub fn dap_terminate(cx: &mut Context) {
     let debugger = debugger!(cx.editor);
 
-    let request = debugger.disconnect();
+    let request = debugger.disconnect(None);
     dap_callback(cx.jobs, request, |editor, _compositor, _response: ()| {
         // editor.set_error(format!("Failed to disconnect: {}", e));
         editor.debugger = None;
@@ -692,37 +632,35 @@ pub fn dap_edit_condition(cx: &mut Context) {
             None => return,
         };
         let callback = Box::pin(async move {
-            let call: Callback =
-                Box::new(move |_editor: &mut Editor, compositor: &mut Compositor| {
-                    let mut prompt = Prompt::new(
-                        "condition:".into(),
-                        None,
-                        ui::completers::none,
-                        move |cx, input: &str, event: PromptEvent| {
-                            if event != PromptEvent::Validate {
-                                return;
-                            }
+            let call: Callback = Callback::EditorCompositor(Box::new(move |editor, compositor| {
+                let mut prompt = Prompt::new(
+                    "condition:".into(),
+                    None,
+                    ui::completers::none,
+                    move |cx, input: &str, event: PromptEvent| {
+                        if event != PromptEvent::Validate {
+                            return;
+                        }
 
-                            let breakpoints = &mut cx.editor.breakpoints.get_mut(&path).unwrap();
-                            breakpoints[pos].condition = match input {
-                                "" => None,
-                                input => Some(input.to_owned()),
-                            };
+                        let breakpoints = &mut cx.editor.breakpoints.get_mut(&path).unwrap();
+                        breakpoints[pos].condition = match input {
+                            "" => None,
+                            input => Some(input.to_owned()),
+                        };
 
-                            let debugger = debugger!(cx.editor);
+                        let debugger = debugger!(cx.editor);
 
-                            if let Err(e) = breakpoints_changed(debugger, path.clone(), breakpoints)
-                            {
-                                cx.editor
-                                    .set_error(format!("Failed to set breakpoints: {}", e));
-                            }
-                        },
-                    );
-                    if let Some(condition) = breakpoint.condition {
-                        prompt.insert_str(&condition)
-                    }
-                    compositor.push(Box::new(prompt));
-                });
+                        if let Err(e) = breakpoints_changed(debugger, path.clone(), breakpoints) {
+                            cx.editor
+                                .set_error(format!("Failed to set breakpoints: {}", e));
+                        }
+                    },
+                );
+                if let Some(condition) = breakpoint.condition {
+                    prompt.insert_str(&condition, editor)
+                }
+                compositor.push(Box::new(prompt));
+            }));
             Ok(call)
         });
         cx.jobs.callback(callback);
@@ -736,36 +674,34 @@ pub fn dap_edit_log(cx: &mut Context) {
             None => return,
         };
         let callback = Box::pin(async move {
-            let call: Callback =
-                Box::new(move |_editor: &mut Editor, compositor: &mut Compositor| {
-                    let mut prompt = Prompt::new(
-                        "log-message:".into(),
-                        None,
-                        ui::completers::none,
-                        move |cx, input: &str, event: PromptEvent| {
-                            if event != PromptEvent::Validate {
-                                return;
-                            }
+            let call: Callback = Callback::EditorCompositor(Box::new(move |editor, compositor| {
+                let mut prompt = Prompt::new(
+                    "log-message:".into(),
+                    None,
+                    ui::completers::none,
+                    move |cx, input: &str, event: PromptEvent| {
+                        if event != PromptEvent::Validate {
+                            return;
+                        }
 
-                            let breakpoints = &mut cx.editor.breakpoints.get_mut(&path).unwrap();
-                            breakpoints[pos].log_message = match input {
-                                "" => None,
-                                input => Some(input.to_owned()),
-                            };
+                        let breakpoints = &mut cx.editor.breakpoints.get_mut(&path).unwrap();
+                        breakpoints[pos].log_message = match input {
+                            "" => None,
+                            input => Some(input.to_owned()),
+                        };
 
-                            let debugger = debugger!(cx.editor);
-                            if let Err(e) = breakpoints_changed(debugger, path.clone(), breakpoints)
-                            {
-                                cx.editor
-                                    .set_error(format!("Failed to set breakpoints: {}", e));
-                            }
-                        },
-                    );
-                    if let Some(log_message) = breakpoint.log_message {
-                        prompt.insert_str(&log_message);
-                    }
-                    compositor.push(Box::new(prompt));
-                });
+                        let debugger = debugger!(cx.editor);
+                        if let Err(e) = breakpoints_changed(debugger, path.clone(), breakpoints) {
+                            cx.editor
+                                .set_error(format!("Failed to set breakpoints: {}", e));
+                        }
+                    },
+                );
+                if let Some(log_message) = breakpoint.log_message {
+                    prompt.insert_str(&log_message, editor);
+                }
+                compositor.push(Box::new(prompt));
+            }));
             Ok(call)
         });
         cx.jobs.callback(callback);
@@ -790,39 +726,38 @@ pub fn dap_switch_stack_frame(cx: &mut Context) {
 
     let frames = debugger.stack_frames[&thread_id].clone();
 
-    let picker = FilePicker::new(
-        frames,
-        |frame| frame.name.as_str().into(), // TODO: include thread_states in the label
-        move |cx, frame, _action| {
-            let debugger = debugger!(cx.editor);
-            // TODO: this should be simpler to find
-            let pos = debugger.stack_frames[&thread_id]
-                .iter()
-                .position(|f| f.id == frame.id);
-            debugger.active_frame = pos;
+    let columns = [ui::PickerColumn::new("frame", |item: &StackFrame, _| {
+        item.name.as_str().into() // TODO: include thread_states in the label
+    })];
+    let picker = Picker::new(columns, 0, frames, (), move |cx, frame, _action| {
+        let debugger = debugger!(cx.editor);
+        // TODO: this should be simpler to find
+        let pos = debugger.stack_frames[&thread_id]
+            .iter()
+            .position(|f| f.id == frame.id);
+        debugger.active_frame = pos;
 
-            let frame = debugger.stack_frames[&thread_id]
-                .get(pos.unwrap_or(0))
-                .cloned();
-            if let Some(frame) = &frame {
-                jump_to_stack_frame(cx.editor, frame);
-            }
-        },
-        move |_editor, frame| {
-            frame
-                .source
-                .as_ref()
-                .and_then(|source| source.path.clone())
-                .map(|path| {
-                    (
-                        path,
-                        Some((
-                            frame.line.saturating_sub(1),
-                            frame.end_line.unwrap_or(frame.line).saturating_sub(1),
-                        )),
-                    )
-                })
-        },
-    );
+        let frame = debugger.stack_frames[&thread_id]
+            .get(pos.unwrap_or(0))
+            .cloned();
+        if let Some(frame) = &frame {
+            jump_to_stack_frame(cx.editor, frame);
+        }
+    })
+    .with_preview(move |_editor, frame| {
+        frame
+            .source
+            .as_ref()
+            .and_then(|source| source.path.as_ref())
+            .map(|path| {
+                (
+                    path.as_path().into(),
+                    Some((
+                        frame.line.saturating_sub(1),
+                        frame.end_line.unwrap_or(frame.line).saturating_sub(1),
+                    )),
+                )
+            })
+    });
     cx.push_layer(Box::new(picker))
 }
